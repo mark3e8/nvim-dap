@@ -960,6 +960,7 @@ do
         api.nvim_buf_attach(bufnr, false, { on_detach = remove_breakpoints })
       end
       local path = api.nvim_buf_get_name(bufnr)
+      path =  path:gsub("/", "\\")
       ---@type dap.SetBreakpointsArguments
       local payload = {
         source = {
