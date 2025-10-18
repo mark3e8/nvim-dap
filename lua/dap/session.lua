@@ -56,6 +56,7 @@ end
 ---@field private handle uv.uv_stream_t
 ---@field current_frame dap.StackFrame|nil
 ---@field initialized boolean
+---@field term_buf? integer
 ---@field stopped_thread_id number|nil
 ---@field id number
 ---@field threads table<number, dap.Thread>
@@ -120,7 +121,11 @@ local function coresume(co)
 end
 
 
-local function launch_external_terminal(env, terminal, args)
+---@param env table<string, string>?
+---@param terminal {command: string, args: string[]?}
+---@param args string[]
+---@param cwd string
+local function launch_external_terminal(env, terminal, args, cwd)
   local handle
   local pid_or_err
   local full_args = {}
@@ -140,6 +145,7 @@ local function launch_external_terminal(env, terminal, args)
   local opts = {
     args = full_args,
     detached = true,
+    cwd = cwd == "" and nil or cwd,
     env = env_formatted,
   }
   handle, pid_or_err = uv.spawn(terminal.command, opts, function(code)
@@ -226,6 +232,7 @@ end
 
 ---@param lsession dap.Session
 local function run_in_terminal(lsession, request)
+  ---@type dap.RunInTerminalRequestArguments
   local body = request.arguments
   log:debug('run_in_terminal', body)
   local settings = dap().defaults[lsession.config.type]
@@ -234,7 +241,7 @@ local function run_in_terminal(lsession, request)
     if not terminal then
       utils.notify('Requested external terminal, but none configured. Fallback to integratedTerminal', vim.log.levels.WARN)
     else
-      local handle, pid = launch_external_terminal(body.env, terminal, body.args)
+      local handle, pid = launch_external_terminal(body.env, terminal, body.args, body.cwd)
       if not handle then
         utils.notify('Could not launch terminal ' .. terminal.command, vim.log.levels.ERROR)
       end
@@ -258,7 +265,9 @@ local function run_in_terminal(lsession, request)
   end
 
   local jobid
+  lsession.term_buf = terminal_buf
   vim.api.nvim_buf_call(terminal_buf, function()
+    ---@diagnostic disable-next-line: deprecated
     local termopen = vim.fn.has("nvim-0.11") == 1 and vim.fn.jobstart or vim.fn.termopen
     jobid = termopen(body.args, {
       env = next(body.env or {}) and body.env or vim.empty_dict(),
@@ -407,7 +416,7 @@ end
 ---@param bufnr number
 ---@param line number
 ---@param column number
----@param switchbuf string
+---@param switchbuf string|fun(bufnr: integer, line: integer, column: integer):nil
 ---@param filetype string
 local function jump_to_location(bufnr, line, column, switchbuf, filetype)
   progress.report('Stopped at line ' .. line)
@@ -505,13 +514,18 @@ local function jump_to_location(bufnr, line, column, switchbuf, filetype)
     return true
   end
 
-  if switchbuf:find('usetab') then
+  if type(switchbuf) == "string" and switchbuf:find('usetab') then
     switchbuf_fn.useopen = switchbuf_fn.usetab
   end
 
-  if switchbuf:find('newtab') then
+  if type(switchbuf) == "string" and switchbuf:find('newtab') then
     switchbuf_fn.vsplit = switchbuf_fn.newtab
     switchbuf_fn.split = switchbuf_fn.newtab
+  end
+
+  if type(switchbuf) == "function" then
+    switchbuf(bufnr, line, column)
+    return
   end
 
   local opts = vim.split(switchbuf, ',', { plain = true })
@@ -533,10 +547,9 @@ end
 --- Must be called in a coroutine
 ---
 ---@param session dap.Session
----@param frame dap.StackFrame
+---@param source dap.Source?
 ---@return number|nil
-local function frame_to_bufnr(session, frame)
-  local source = frame.source
+local function source_to_bufnr(session, source)
   if not source then
     return nil
   end
@@ -573,12 +586,13 @@ local function jump_to_frame(session, frame, preserve_focus_hint, stopped)
   if preserve_focus_hint or frame.line < 0 then
     return
   end
-  local bufnr = frame_to_bufnr(session, frame)
+  local bufnr = source_to_bufnr(session, frame.source)
   if not bufnr then
     utils.notify('Source missing, cannot jump to frame: ' .. frame.name, vim.log.levels.INFO)
     return
   end
   vim.fn.bufload(bufnr)
+  vim.bo[bufnr].buflisted = true
   local ok, failure = pcall(vim.fn.sign_place, 0, session.sign_group, 'DapStopped', bufnr, { lnum = frame.line; priority = 22 })
   if not ok then
     utils.notify(tostring(failure), vim.log.levels.ERROR)
@@ -761,6 +775,7 @@ function Session:event_stopped(stopped)
       utils.notify('Error retrieving stack traces: ' .. tostring(err), vim.log.levels.ERROR)
       return
     end
+    assert(response, "Must have response if there is no error")
     local frames = response.stackFrames --[=[@as dap.StackFrame[]]=]
     thread.frames = frames
     local current_frame = get_top_frame(frames)
@@ -773,7 +788,7 @@ function Session:event_stopped(stopped)
       jump_to_frame(self, current_frame, stopped.preserveFocusHint, stopped)
       self:_request_scopes(current_frame)
     elseif stopped.reason == "exception" then
-      local bufnr = frame_to_bufnr(self, current_frame)
+      local bufnr = source_to_bufnr(self, current_frame.source)
       if bufnr then
         self:_show_exception_info(stopped.threadId, bufnr, current_frame)
       end
@@ -2035,6 +2050,7 @@ function Session:event_thread(event)
       thread.stopped = false
       if self.stopped_thread_id == thread.id then
         self.stopped_thread_id = nil
+        self.current_frame = nil
       end
     else
       self.dirty.threads = true
@@ -2054,10 +2070,12 @@ function Session:event_continued(event)
       t.stopped = false
     end
     self.stopped_thread_id = nil
+    self.current_frame = nil
     vim.fn.sign_unplace(self.sign_group)
   else
     if self.stopped_thread_id == event.threadId then
       self.stopped_thread_id = nil
+      self.current_frame = nil
       vim.fn.sign_unplace(self.sign_group)
     end
     local thread = self.threads[event.threadId]
@@ -2069,11 +2087,25 @@ end
 
 
 ---@param event dap.BreakpointEvent
-function Session.event_breakpoint(_, event)
+function Session.event_breakpoint(session, event)
   if event.reason == 'changed' then
     local bp = event.breakpoint
     if bp.id then
       breakpoints.update(bp)
+    end
+  elseif event.reason == 'new' then
+    local bp = event.breakpoint
+    if bp.id then
+      local bufnr = source_to_bufnr(session, bp.source)
+      if bufnr then
+        breakpoints.set({}, bufnr, bp.line)
+        breakpoints.set_state(bufnr, bp)
+      end
+    end
+  elseif event.reason == 'removed' then
+    local bp = event.breakpoint
+    if bp.id then
+      breakpoints.remove_by_id(bp.id)
     end
   end
 end

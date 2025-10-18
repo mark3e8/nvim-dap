@@ -20,6 +20,7 @@ describe('dap with fake server', function()
   end)
   after_each(function()
     server.stop()
+    dap.terminate({ all = true, hierarchy = true })
     dap.close()
     require('dap.breakpoints').clear()
     wait(function() return dap.session() == nil end)
@@ -135,6 +136,9 @@ describe('dap with fake server', function()
       }
     end)
     local diagnostics = vim.diagnostic.get(buf)
+    for _, d in ipairs(diagnostics) do
+      d._extmark_id = nil
+    end
     local expected = {
       {
         bufnr = buf,
@@ -413,7 +417,8 @@ describe('dap with fake server', function()
       threadId = 1,
     })
     wait(function() return session.threads[1].stopped == false end)
-    assert.are.is_nil(session.stopped_thread_id)
+    assert.is_nil(session.stopped_thread_id)
+    assert.is_nil(session.current_frame)
     local signs = vim.fn.sign_getplaced(vim.uri_to_bufnr(path), {group = session.sign_group})
     assert.are.same({}, signs[1].signs)
   end)
@@ -501,6 +506,39 @@ describe('dap with fake server', function()
     wait(function() return msg ~= nil end)
     assert.is_nil(dap.session())
     assert.are.same("Run aborted", msg)
+  end)
+
+  it("triggers on_session listener on session changes", function()
+    local on_session_results = {}
+    local conf1 = {
+      name = "s1",
+      type = "dummy",
+      request = "launch"
+    }
+    dap.listeners.on_session["dap.testcase"] = function (old, new)
+      table.insert(on_session_results, { old = old, new = new })
+    end
+    local session1 = run_and_wait_until_initialized(conf1, server)
+    assert.are.same(1, #on_session_results)
+    assert.are.same(session1.id, on_session_results[1].new.id)
+
+    local conf2 = {
+      name = "s2",
+      type = "dummy",
+      request = "launch"
+    }
+    local session2 = run_and_wait_until_initialized(conf2, server)
+    assert.are.same(2, #on_session_results)
+    assert.are.same(session1.id, on_session_results[2].old.id)
+    assert.are.same(session2.id, on_session_results[2].new.id)
+
+    dap.set_session(session1)
+    assert.are.same(3, #on_session_results)
+
+    dap.terminate({ all = true })
+    wait(function() return dap.session() == nil end)
+    assert.are.same(5, #on_session_results)
+    assert.is_nil(on_session_results[5].new)
   end)
 end)
 
@@ -714,13 +752,13 @@ describe('run_to_cursor', function()
   local server
   before_each(function()
     server = require('spec.server').spawn()
+    dap.adapters.dummy = server.adapter
     server.client.setBreakpoints = function(self, request)
       local breakpoints = request.arguments.breakpoints
       self:send_response(request, {
         breakpoints = vim.tbl_map(function() return { verified = true } end, breakpoints)
       })
     end
-    dap.adapters.dummy = server.adapter
   end)
   after_each(function()
     dap.close()
@@ -935,6 +973,63 @@ describe('breakpoint events', function()
 
     signs = vim.fn.sign_getplaced(buf1, { group = 'dap_breakpoints' })
     assert.are.same('DapBreakpoint', signs[1].signs[1].name)
+  end)
+
+  it('can add and remove breakpoints from adapter events', function()
+    run_and_wait_until_initialized(config, server)
+
+    local win = api.nvim_get_current_win()
+    local buf2 = api.nvim_create_buf(false, true)
+    api.nvim_buf_set_name(buf2, 'dummy_buf2')
+    api.nvim_buf_set_lines(buf2, 0, -1, false, {'buf2: line1'})
+    api.nvim_win_set_buf(win, buf2)
+    api.nvim_win_set_cursor(win, { 1, 0 })
+
+    -- initialize, launch == 2 requests
+    wait(function() return #server.spy.requests == 2 end)
+    wait(function() return #server.spy.responses == 2 end)
+
+    local breakpoint_state = {
+      id = 1,
+      line = 1,
+      verified = true,
+      source = {
+        path = vim.uri_from_bufnr(buf2)
+      },
+    }
+
+    local num_events = #server.spy.events
+    server.client:send_event('breakpoint', {
+      reason = 'new',
+      breakpoint = breakpoint_state,
+    })
+
+    local breakpoints = require('dap.breakpoints')
+
+    wait(function() return #server.spy.events == num_events + 1 end)
+    wait(function() return breakpoints.get()[buf2] ~= nil end)
+
+    local expected_breakpoints = {
+      [buf2] = {
+        [1] = {
+          line = breakpoint_state.line,
+          state = breakpoint_state,
+        }
+      }
+    }
+
+    assert.are.same(expected_breakpoints, breakpoints.get())
+
+    num_events = #server.spy.events
+    server.client:send_event('breakpoint', {
+      reason = 'removed',
+      breakpoint = { id = 1 },
+    })
+
+    wait(function() return #server.spy.events == num_events + 1 end)
+    wait(function() return breakpoints.get()[buf2] == nil end)
+
+    assert.are.same({}, breakpoints.get())
   end)
 end)
 
@@ -1227,22 +1322,21 @@ describe("on_output", function()
   local server
   before_each(function()
     server = require('spec.server').spawn()
-    dap.adapters.dummy = server.adapter
+    dap.adapters.dummy_on_output = server.adapter
   end)
   after_each(function()
-    server.stop()
     dap.terminate()
+    server.stop()
     wait(function() return dap.session() == nil end, "Session should become nil after terminate")
     assert.are.same(0, vim.tbl_count(dap.sessions()), "Sessions should go down to 0 after terminate/stop")
-
-    dap.defaults.fallback.on_output = nil
-    assert.are.is_nil(dap.defaults.fallback.on_output)
+    dap.defaults.dummy_on_output.on_output = nil
+    assert.are.is_nil(dap.defaults.dummy_on_output.on_output)
   end)
 
   it("can override output handling", function()
     local captured_output = nil
 
-    function dap.defaults.fallback.on_output(_, output)
+    function dap.defaults.dummy_on_output.on_output(_, output)
       captured_output = output
     end
 
@@ -1255,7 +1349,12 @@ describe("on_output", function()
       })
     end
 
-    run_and_wait_until_initialized(config, server)
+    run_and_wait_until_initialized({
+      type = "dummy_on_output",
+      request = "launch",
+      name = "dummy"
+    }, server)
+
     assert.are.same(captured_output, {
       category = "stdout",
       output = "dummy output"
